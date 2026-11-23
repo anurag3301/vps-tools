@@ -1,0 +1,25 @@
+/target/
+*.apk
+*.aab
+
+# Android / Gradle
+.gradle/
+build/
+.kotlin/
+local.properties
+*.keystore
+*.jks
+.idea/
+*.iml
+captures/
+
+# secrets and local state
+.env
+.env.*
+*.pem
+*.key
+config.json
+channels.txt
+*.log
+
+.DS_Store
