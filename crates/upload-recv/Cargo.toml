@@ -8,4 +8,4 @@ name = "noti-upload-recv"
 path = "src/main.rs"
 
 [dependencies]
-rand = "0.8"
+store = { path = "../store" }

@@ -5,16 +5,20 @@
 //! - Every request is HMAC-signed with a role key; timestamp window + nonce replay cache.
 //! - Payloads are opaque ciphertext; nothing is written to disk but the channels file.
 //! - Per-IP auth-failure lockout, per-channel send rate limit, size and queue caps, TTL.
+//! - Optional file API (`--files-root`): the paired phone can upload, list, delete files. The body
+//!   is streamed to disk; its SHA-256 is signed up front and verified when the stream ends.
 
 use axum::{
-    body::Bytes,
-    extract::{ConnectInfo, DefaultBodyLimit, Query, State},
+    body::{Body, Bytes},
+    extract::{ConnectInfo, DefaultBodyLimit, Path as UrlPath, Query, State},
     http::{HeaderMap, Method, StatusCode, Uri},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
+use http_body_util::BodyExt;
 use proto::{Role, MAX_BODY, MAX_SKEW_SECS};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
@@ -22,7 +26,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Notify;
+use tokio::{io::AsyncWriteExt, sync::{Notify, Semaphore}};
 
 const QUEUE_CAP: usize = 500;
 const TTL: Duration = Duration::from_secs(24 * 3600);
@@ -34,6 +38,15 @@ const FAIL_WINDOW: Duration = Duration::from_secs(600);
 const NONCE_TTL: Duration = Duration::from_secs(2 * MAX_SKEW_SECS as u64 + 10);
 const MAX_NONCES: usize = 4096;
 const MAX_TRACKED_IPS: usize = 10_000;
+const UPLOAD_CONCURRENCY: usize = 2;
+const UPLOAD_IDLE: Duration = Duration::from_secs(30);
+const UPLOAD_TOTAL: Duration = Duration::from_secs(20 * 60);
+
+struct FilesCfg {
+    root: PathBuf,
+    base_url: String,
+    slots: Arc<Semaphore>,
+}
 
 struct ChanKeys {
     phone: [u8; 32],
@@ -75,6 +88,7 @@ struct App {
     chans: Mutex<HashMap<String, ChanKeys>>,
     queues: Mutex<HashMap<String, Queue>>,
     fails: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    files: Option<FilesCfg>,
 }
 
 type Shared = Arc<App>;
@@ -152,6 +166,19 @@ impl App {
         body: &[u8],
         role: Role,
     ) -> Result<String, StatusCode> {
+        self.authenticate_hashed(ip, h, method, uri, &hex::encode(Sha256::digest(body)), role)
+    }
+
+    /// Like `authenticate`, with the body's SHA-256 (hex) given instead of the body itself.
+    fn authenticate_hashed(
+        &self,
+        ip: IpAddr,
+        h: &HeaderMap,
+        method: &Method,
+        uri: &Uri,
+        body_sha256: &str,
+        role: Role,
+    ) -> Result<String, StatusCode> {
         if self.banned(ip) {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
@@ -182,7 +209,7 @@ impl App {
             }
         };
         let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        let input = proto::signing_input(method.as_str(), pq, ts, nonce, body);
+        let input = proto::signing_input_hashed(method.as_str(), pq, ts, nonce, body_sha256);
         if !proto::verify(&key, &input, sig) {
             return fail(StatusCode::UNAUTHORIZED);
         }
@@ -316,6 +343,169 @@ async fn poll(
     Ok(Json(PollResp { messages }))
 }
 
+// ---- file API (phone role) ----
+
+type FileErr = (StatusCode, String);
+
+fn files_cfg(app: &App) -> Result<&FilesCfg, FileErr> {
+    app.files.as_ref().ok_or((StatusCode::NOT_FOUND, String::new()))
+}
+
+fn plain(s: StatusCode) -> FileErr {
+    (s, String::new())
+}
+
+fn phone_auth(app: &App, peer: SocketAddr, h: &HeaderMap, m: &Method, uri: &Uri) -> Result<(), FileErr> {
+    files_cfg(app)?;
+    app.authenticate(client_ip(peer, h), h, m, uri, b"", Role::Phone).map(|_| ()).map_err(plain)
+}
+
+#[derive(Serialize)]
+struct FileItem {
+    #[serde(flatten)]
+    entry: store::Entry,
+    url: String,
+}
+
+#[derive(Serialize)]
+struct FileList {
+    files: Vec<FileItem>,
+}
+
+async fn files_list(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<FileList>, FileErr> {
+    phone_auth(&app, peer, &headers, &method, &uri)?;
+    let cfg = files_cfg(&app)?;
+    let mut entries = store::entries(&cfg.root);
+    entries.sort_by(|a, b| b.uploaded.cmp(&a.uploaded));
+    let files = entries
+        .into_iter()
+        .map(|entry| FileItem { url: format!("{}/{}/{}", cfg.base_url.trim_end_matches('/'), entry.id, entry.name), entry })
+        .collect();
+    Ok(Json(FileList { files }))
+}
+
+async fn files_stat(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<store::Stat>, FileErr> {
+    phone_auth(&app, peer, &headers, &method, &uri)?;
+    Ok(Json(store::stat(&files_cfg(&app)?.root)))
+}
+
+async fn files_delete(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    UrlPath(id): UrlPath<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<StatusCode, FileErr> {
+    phone_auth(&app, peer, &headers, &method, &uri)?;
+    store::delete(&files_cfg(&app)?.root, &id).map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn files_clear(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, FileErr> {
+    phone_auth(&app, peer, &headers, &method, &uri)?;
+    let n = store::clear(&files_cfg(&app)?.root);
+    Ok(Json(serde_json::json!({ "deleted": n })))
+}
+
+#[derive(Serialize)]
+struct PutResp {
+    id: String,
+    name: String,
+    url: String,
+    size: u64,
+    expires: u64,
+}
+
+async fn files_put(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    UrlPath(name): UrlPath<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    mut body: Body,
+) -> Result<Json<PutResp>, FileErr> {
+    let cfg = files_cfg(&app)?;
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
+    let expected = hdr(&headers, "x-body-sha256").unwrap_or("").to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad("missing x-body-sha256"));
+    }
+    let size: u64 = hdr(&headers, "content-length").and_then(|v| v.parse().ok()).ok_or_else(|| bad("content-length required"))?;
+    app.authenticate_hashed(client_ip(peer, &headers), &headers, &method, &uri, &expected, Role::Phone).map_err(plain)?;
+    let _slot = cfg.slots.clone().try_acquire_owned().map_err(|_| plain(StatusCode::TOO_MANY_REQUESTS))?;
+
+    let pending = store::begin(&cfg.root, size, &name).map_err(|e| {
+        let code = if e.contains("too large") {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else if e.contains("quota") {
+            StatusCode::INSUFFICIENT_STORAGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (code, e)
+    })?;
+    let mut out = tokio::fs::File::create(pending.part_path()).await.map_err(|e| plain_io(&e))?;
+    let (mut got, mut hasher, started) = (0u64, Sha256::new(), Instant::now());
+    loop {
+        if started.elapsed() > UPLOAD_TOTAL {
+            return Err(plain(StatusCode::REQUEST_TIMEOUT));
+        }
+        let frame = match tokio::time::timeout(UPLOAD_IDLE, body.frame()).await {
+            Err(_) => return Err(plain(StatusCode::REQUEST_TIMEOUT)),
+            Ok(None) => break,
+            Ok(Some(Err(_))) => return Err(bad("body error")),
+            Ok(Some(Ok(f))) => f,
+        };
+        let Ok(data) = frame.into_data() else { continue };
+        got += data.len() as u64;
+        if got > size {
+            return Err(bad("body longer than content-length"));
+        }
+        hasher.update(&data);
+        out.write_all(&data).await.map_err(|e| plain_io(&e))?;
+    }
+    out.flush().await.map_err(|e| plain_io(&e))?;
+    drop(out);
+    if got != size {
+        return Err(bad("size mismatch"));
+    }
+    if hex::encode(hasher.finalize()) != expected {
+        return Err(bad("sha256 mismatch"));
+    }
+    let done = pending.finish().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(PutResp {
+        url: format!("{}/{}/{}", cfg.base_url.trim_end_matches('/'), done.id, done.name),
+        id: done.id,
+        name: done.name,
+        size,
+        expires: done.expires,
+    }))
+}
+
+fn plain_io(_e: &std::io::Error) -> FileErr {
+    (StatusCode::INSUFFICIENT_STORAGE, "storage error".into())
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -343,6 +533,10 @@ fn router(app: Shared) -> Router {
     Router::new()
         .route("/v1/send", post(send))
         .route("/v1/poll", get(poll))
+        .route("/v1/files", get(files_list))
+        .route("/v1/files/stat", get(files_stat))
+        .route("/v1/files/clear", post(files_clear))
+        .route("/v1/files/:name", put(axum::handler::Handler::layer(files_put, DefaultBodyLimit::disable())).delete(files_delete))
         .route("/healthz", get(health))
         .layer(DefaultBodyLimit::max(MAX_BODY + 1024))
         .with_state(app)
@@ -350,7 +544,7 @@ fn router(app: Shared) -> Router {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  noti-relay serve [--listen 127.0.0.1:8787] [--channels FILE]\n  noti-relay add [--channels FILE] '<channel> <phone-key> <laptop-key>'\n  noti-relay list [--channels FILE]\n  noti-relay remove [--channels FILE] <channel-prefix>"
+        "usage:\n  noti-relay serve [--listen 127.0.0.1:8787] [--channels FILE] [--files-root DIR --files-url URL]\n  noti-relay add [--channels FILE] '<channel> <phone-key> <laptop-key>'\n  noti-relay list [--channels FILE]\n  noti-relay remove [--channels FILE] <channel-prefix>"
     );
     std::process::exit(2)
 }
@@ -359,17 +553,27 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut listen = "127.0.0.1:8787".to_string();
     let mut channels = PathBuf::from("channels.txt");
+    let (mut files_root, mut files_url) = (None::<PathBuf>, None::<String>);
     let mut rest = vec![];
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--listen" => listen = it.next().unwrap_or_else(|| usage()).clone(),
             "--channels" => channels = it.next().unwrap_or_else(|| usage()).into(),
+            "--files-root" => files_root = Some(it.next().unwrap_or_else(|| usage()).into()),
+            "--files-url" => files_url = Some(it.next().unwrap_or_else(|| usage()).clone()),
             _ => rest.push(a.clone()),
         }
     }
     match args.first().map(String::as_str) {
-        Some("serve") => serve(listen, channels),
+        Some("serve") => {
+            let files = match (files_root, files_url) {
+                (Some(root), Some(base_url)) => Some(FilesCfg { root, base_url, slots: Arc::new(Semaphore::new(UPLOAD_CONCURRENCY)) }),
+                (None, None) => None,
+                _ => usage(),
+            };
+            serve(listen, channels, files)
+        }
         Some("add") => {
             let mut line = rest.first().unwrap_or_else(|| usage()).clone();
             if line == "-" {
@@ -412,12 +616,13 @@ fn open_private(path: &Path) -> std::fs::File {
 }
 
 #[tokio::main]
-async fn serve_async(listen: String, channels: PathBuf) {
+async fn serve_async(listen: String, channels: PathBuf, files: Option<FilesCfg>) {
     let app = Arc::new(App {
         chans: Mutex::new(load_channels(&channels)),
         channels_path: channels,
         queues: Mutex::new(HashMap::new()),
         fails: Mutex::new(HashMap::new()),
+        files,
     });
     tokio::spawn(background(app.clone()));
     let l = tokio::net::TcpListener::bind(&listen).await.expect("bind");
@@ -430,8 +635,8 @@ async fn serve_async(listen: String, channels: PathBuf) {
         .unwrap();
 }
 
-fn serve(listen: String, channels: PathBuf) {
-    serve_async(listen, channels)
+fn serve(listen: String, channels: PathBuf, files: Option<FilesCfg>) {
+    serve_async(listen, channels, files)
 }
 
 #[cfg(test)]
@@ -453,7 +658,93 @@ mod tests {
             chans: Mutex::new(m),
             queues: Mutex::new(HashMap::new()),
             fails: Mutex::new(HashMap::new()),
+            files: None,
         })
+    }
+
+    fn app_with_files(keys: &proto::Keys, root: &Path) -> Shared {
+        let a = app_with(keys);
+        let mut a = Arc::try_unwrap(a).ok().unwrap();
+        a.files = Some(FilesCfg { root: root.into(), base_url: "https://x.test/f".into(), slots: Arc::new(Semaphore::new(2)) });
+        Arc::new(a)
+    }
+
+    fn put_req(keys: &proto::Keys, name: &str, data: &[u8], claimed_hash: &str, nonce: &str) -> Request<Body> {
+        let t = now_secs();
+        let path = format!("/v1/files/{name}");
+        let sig = proto::sign(&keys.auth_phone, &proto::signing_input_hashed("PUT", &path, t, nonce, claimed_hash));
+        Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("x-chan", keys.channel_hex())
+            .header("x-ts", t.to_string())
+            .header("x-nonce", nonce)
+            .header("x-sig", sig)
+            .header("x-body-sha256", claimed_hash)
+            .header("content-length", data.len().to_string())
+            .extension(ConnectInfo(SocketAddr::from(([203, 0, 113, 9], 1))))
+            .body(Body::from(data.to_vec()))
+            .unwrap()
+    }
+
+    async fn json(r: axum::response::Response) -> serde_json::Value {
+        serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn file_api_put_list_delete() {
+        let keys = proto::derive(&proto::new_secret());
+        let root = std::env::temp_dir().join(format!("relay-files-{}", rand_id()));
+        let r = router(app_with_files(&keys, &root));
+        let data = vec![7u8; 100_000]; // larger than the 16KB JSON body cap
+        let h = hex::encode(Sha256::digest(&data));
+
+        let ok = oneshot(r.clone(), put_req(&keys, "my%20file.bin", &data, &h, "p1")).await;
+        assert_eq!(ok.status(), 200);
+        let v = json(ok).await;
+        assert!(v["url"].as_str().unwrap().starts_with("https://x.test/f/"));
+        assert_eq!(v["name"], "my_file.bin");
+        let id = v["id"].as_str().unwrap().to_string();
+
+        // hash claimed in the signature must match the streamed body
+        let bad = oneshot(r.clone(), put_req(&keys, "evil.bin", b"tampered", &h, "p2")).await;
+        assert_eq!(bad.status(), 400);
+        // replayed nonce
+        let rp = oneshot(r.clone(), put_req(&keys, "again.bin", &data, &h, "p1")).await;
+        assert_eq!(rp.status(), 401);
+
+        let l = oneshot(r.clone(), req(&keys, Role::Phone, "GET", "/v1/files", "", now_secs(), "l1")).await;
+        let v = json(l).await;
+        assert_eq!(v["files"].as_array().unwrap().len(), 1);
+        assert_eq!(v["files"][0]["size"], 100_000);
+        assert_eq!(v["files"][0]["url"], format!("https://x.test/f/{id}/my_file.bin"));
+
+        let st = oneshot(r.clone(), req(&keys, Role::Phone, "GET", "/v1/files/stat", "", now_secs(), "s1")).await;
+        assert_eq!(json(st).await["count"], 1);
+
+        // laptop role is not allowed to touch files
+        let lap = oneshot(r.clone(), req(&keys, Role::Laptop, "GET", "/v1/files", "", now_secs(), "l2")).await;
+        assert_eq!(lap.status(), 401);
+
+        let d = oneshot(r.clone(), req(&keys, Role::Phone, "DELETE", &format!("/v1/files/{id}"), "", now_secs(), "d1")).await;
+        assert_eq!(d.status(), 204);
+        let d2 = oneshot(r.clone(), req(&keys, Role::Phone, "DELETE", &format!("/v1/files/{id}"), "", now_secs(), "d2")).await;
+        assert_eq!(d2.status(), 404);
+        let c = oneshot(r.clone(), req(&keys, Role::Phone, "POST", "/v1/files/clear", "", now_secs(), "c1")).await;
+        assert_eq!(json(c).await["deleted"], 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_api_disabled_without_root() {
+        let keys = proto::derive(&proto::new_secret());
+        let r = router(app_with(&keys));
+        let l = oneshot(r, req(&keys, Role::Phone, "GET", "/v1/files", "", now_secs(), "l1")).await;
+        assert_eq!(l.status(), 404);
+    }
+
+    fn rand_id() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
     }
 
     fn req(keys: &proto::Keys, role: Role, method: &str, pq: &str, body: &str, ts: i64, nonce: &str) -> Request<Body> {

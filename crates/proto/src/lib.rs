@@ -107,14 +107,13 @@ pub fn open(enc: &[u8; 32], channel: &[u8; 16], sealed: &str) -> Result<Vec<u8>,
 
 /// Canonical string that is HMAC'd for request authentication.
 pub fn signing_input(method: &str, path_and_query: &str, ts: i64, nonce: &str, body: &[u8]) -> String {
-    format!(
-        "v1\n{}\n{}\n{}\n{}\n{}",
-        method.to_ascii_uppercase(),
-        path_and_query,
-        ts,
-        nonce,
-        hex::encode(Sha256::digest(body))
-    )
+    signing_input_hashed(method, path_and_query, ts, nonce, &hex::encode(Sha256::digest(body)))
+}
+
+/// Same as `signing_input` but with the body's SHA-256 (hex) supplied, so large bodies can be
+/// authenticated before they are read and verified against the hash while streaming.
+pub fn signing_input_hashed(method: &str, path_and_query: &str, ts: i64, nonce: &str, body_sha256_hex: &str) -> String {
+    format!("v1\n{}\n{}\n{}\n{}\n{}", method.to_ascii_uppercase(), path_and_query, ts, nonce, body_sha256_hex)
 }
 
 pub fn sign(key: &[u8; 32], input: &str) -> String {
@@ -200,6 +199,12 @@ mod tests {
         assert!(verify(&k.auth_phone, &i, &s));
         assert!(!verify(&k.auth_laptop, &i, &s));
         assert!(!verify(&k.auth_phone, &signing_input("post", "/v1/send", 1, "n", b"y"), &s));
+    }
+
+    #[test]
+    fn hashed_input_matches() {
+        let h = hex::encode(Sha256::digest(b"x"));
+        assert_eq!(signing_input("put", "/p", 1, "n", b"x"), signing_input_hashed("PUT", "/p", 1, "n", &h));
     }
 
     #[test]

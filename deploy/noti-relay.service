@@ -5,11 +5,15 @@ After=network.target
 [Service]
 User=noti
 Group=noti
-ExecStart=/usr/local/bin/noti-relay serve --listen 127.0.0.1:8787 --channels /var/lib/noti-relay/channels.txt
+ExecStart=/usr/local/bin/noti-relay serve --listen 127.0.0.1:8787 --channels /var/lib/noti-relay/channels.txt --files-root /var/lib/noti-upload --files-url https://anurag3301.dev/f
 Restart=always
 RestartSec=2
 StateDirectory=noti-relay
 StateDirectoryMode=0750
+# File API shares the upload store with the ssh receiver (group `upload`).
+SupplementaryGroups=upload
+ReadWritePaths=/var/lib/noti-upload
+UMask=0002
 
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -27,7 +31,7 @@ MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
 CapabilityBoundingSet=
-MemoryMax=64M
+MemoryMax=128M
 TasksMax=64
 
 [Install]

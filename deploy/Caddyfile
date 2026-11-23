@@ -20,6 +20,18 @@ https://notify.anurag3301.dev:8443 {
 			}
 		}
 	}
+	# Phone file API: authenticated by the relay itself; the body is streamed (up to 256 MB).
+	@files path /v1/files /v1/files/*
+	handle @files {
+		request_body {
+			max_size 257MB
+		}
+		reverse_proxy 127.0.0.1:8787 {
+			transport http {
+				response_header_timeout 120s
+			}
+		}
+	}
 	handle {
 		respond 404
 	}

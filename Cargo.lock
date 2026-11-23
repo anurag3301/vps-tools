@@ -713,9 +713,12 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "hex",
+ "http-body-util",
  "proto",
  "serde",
  "serde_json",
+ "sha2",
+ "store",
  "tokio",
  "tower",
 ]
@@ -909,6 +912,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "store"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rand",
+ "serde",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -969,6 +981,7 @@ version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
@@ -1076,7 +1089,7 @@ dependencies = [
 name = "upload-recv"
 version = "0.1.0"
 dependencies = [
- "rand",
+ "store",
 ]
 
 [[package]]
