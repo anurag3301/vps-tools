@@ -1,0 +1,11 @@
+[package]
+name = "upload-recv"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "noti-upload-recv"
+path = "src/main.rs"
+
+[dependencies]
+rand = "0.8"
