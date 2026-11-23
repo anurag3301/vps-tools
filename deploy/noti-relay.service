@@ -1,0 +1,34 @@
+[Unit]
+Description=noti relay (E2E-encrypted notification relay)
+After=network.target
+
+[Service]
+User=noti
+Group=noti
+ExecStart=/usr/local/bin/noti-relay serve --listen 127.0.0.1:8787 --channels /var/lib/noti-relay/channels.txt
+Restart=always
+RestartSec=2
+StateDirectory=noti-relay
+StateDirectoryMode=0750
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+MemoryMax=64M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

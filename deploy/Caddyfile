@@ -1,0 +1,35 @@
+# Caddy only fronts the relay, on :8443. The main site (gunicorn :443, redirect :80) is untouched.
+# TLS cert is issued/renewed by certbot (webroot) and copied to /etc/caddy/certs by caddy-cert-hook.sh.
+{
+	auto_https off
+	admin off
+}
+
+https://notify.anurag3301.dev:8443 {
+	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+
+	# Only the relay's routes are forwarded; everything else is dropped at the edge.
+	@api path /v1/send /v1/poll /healthz
+	handle @api {
+		request_body {
+			max_size 20KB
+		}
+		reverse_proxy 127.0.0.1:8787 {
+			transport http {
+				response_header_timeout 40s
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+	log {
+		output discard
+	}
+}
