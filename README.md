@@ -37,9 +37,26 @@ phone app ──HTTPS POST (ciphertext)──► relay (VPS, Caddy TLS) ◄─�
 | `crates/relay` | `noti-relay`: closed, in-memory relay (axum) |
 | `crates/daemon` | `noti-daemon`: pair / receive / `test-send` |
 | `crates/upload` | `upload` client |
+| `crates/store` | Shared upload store (quota, retention, gc) used by the relay and the ssh receiver |
 | `crates/upload-recv` | `noti-upload-recv`: server-side receiver, list/delete, gc |
-| `android/` | Kotlin app (`NotificationListenerService`), no UI framework deps |
+| `android/` | Kotlin + Jetpack Compose (Material 3) app: notification forwarder and file manager |
 | `deploy/` | systemd units, Caddyfile, VPS hardening script |
+
+## Phone app
+
+The paired phone is also a client of the upload store, authenticated with the same phone key (no extra secrets).
+Upload from the Files tab or via the Android share sheet, then list, copy/share the link, download or delete.
+It uses the relay's phone-role endpoints (`GET /v1/files`, `GET /v1/files/stat`, `PUT /v1/files/:name`,
+`DELETE /v1/files/:id`, `POST /v1/files/clear`). A PUT signs the body's SHA-256 up front, and the relay streams the
+body to disk and verifies the hash, so large files are never buffered. Files are public links, not E2E encrypted.
+
+| Home | Files | Actions | Settings |
+|---|---|---|---|
+| ![](docs/screenshots/02-home.png) | ![](docs/screenshots/03-files.png) | ![](docs/screenshots/04-file-actions.png) | ![](docs/screenshots/05-settings.png) |
+
+Dark mode: [files](docs/screenshots/06-files-dark.png), [home](docs/screenshots/07-home-dark.png).
+Screenshots come from the `demo` build variant (`./gradlew assembleDemo`), which allows cleartext to the
+emulator host only and is never shipped.
 
 ## Security model
 - **E2E:** one 32-byte secret is created on the laptop and handed to the phone via QR. Payloads are ChaCha20-Poly1305 sealed (channel id as AAD). The relay never has the key, so it only sees ciphertext.
