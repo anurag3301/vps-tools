@@ -78,6 +78,12 @@ object Store {
         ctx.getSharedPreferences("icons", Context.MODE_PRIVATE).edit().putString(pkg, "$sentAt:$appUpdated").apply()
     }
 
+    fun dynamicColor(ctx: Context): Boolean = prefs(ctx).getBoolean("dynamic", false)
+
+    fun setDynamicColor(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean("dynamic", on).apply()
+    }
+
     fun setStatus(ctx: Context, s: String) {
         prefs(ctx).edit().putString("status", s).apply()
     }

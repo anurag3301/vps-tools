@@ -47,8 +47,11 @@ object Crypto {
     }
 
     fun signingInput(method: String, pathAndQuery: String, ts: Long, nonce: String, body: ByteArray): String =
-        "v1\n${method.uppercase()}\n$pathAndQuery\n$ts\n$nonce\n" +
-            hex(MessageDigest.getInstance("SHA-256").digest(body))
+        signingInputHashed(method, pathAndQuery, ts, nonce, hex(MessageDigest.getInstance("SHA-256").digest(body)))
+
+    /** For large bodies: the SHA-256 (hex) is signed up front and verified by the relay while streaming. */
+    fun signingInputHashed(method: String, pathAndQuery: String, ts: Long, nonce: String, bodySha256Hex: String): String =
+        "v1\n${method.uppercase()}\n$pathAndQuery\n$ts\n$nonce\n$bodySha256Hex"
 
     fun sign(key: ByteArray, input: String): String = hex(hmac(key, input.toByteArray()))
 
