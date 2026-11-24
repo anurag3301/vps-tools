@@ -34,10 +34,15 @@ fn die(msg: &str) -> ! {
     exit(1)
 }
 
+fn home() -> PathBuf {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    PathBuf::from(env::var_os(var).unwrap_or_default())
+}
+
 fn log_path() -> PathBuf {
     env::var_os("UPLOAD_LOG")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".upload_list"))
+        .unwrap_or_else(|| home().join(".upload_list"))
 }
 
 /// Must match the server's sanitizer so the command we send contains no whitespace or metacharacters.
@@ -54,12 +59,14 @@ fn sanitize(name: &str) -> String {
     }
 }
 
+/// Formats a local time; `at` is a unix timestamp (default: now).
 fn date(fmt: &str, at: Option<&str>) -> String {
-    let mut c = Command::new("date");
-    if let Some(ts) = at {
-        c.arg(format!("--date=@{ts}"));
-    }
-    String::from_utf8_lossy(&c.arg(fmt).output().map(|o| o.stdout).unwrap_or_default()).trim().to_string()
+    use chrono::{DateTime, Local, TimeZone};
+    let t: DateTime<Local> = match at.and_then(|t| t.parse::<i64>().ok()) {
+        Some(ts) => Local.timestamp_opt(ts, 0).single().unwrap_or_else(Local::now),
+        None => Local::now(),
+    };
+    t.format(fmt.trim_start_matches('+')).to_string()
 }
 
 fn upload(path: &str) {
@@ -127,13 +134,20 @@ fn upload(path: &str) {
 }
 
 fn clipboard_and_notify(url: &str) {
-    let tool = if env::var_os("WAYLAND_DISPLAY").is_some() { vec!["wl-copy"] } else { vec!["xclip", "-selection", "clipboard"] };
+    let tool: Vec<&str> = if cfg!(windows) {
+        vec!["clip"]
+    } else if env::var_os("WAYLAND_DISPLAY").is_some() {
+        vec!["wl-copy"]
+    } else {
+        vec!["xclip", "-selection", "clipboard"]
+    };
     if let Ok(mut c) = Command::new(tool[0]).args(&tool[1..]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
         if let Some(mut s) = c.stdin.take() {
             let _ = s.write_all(url.as_bytes());
         }
         let _ = c.wait();
     }
+    #[cfg(not(windows))]
     let _ = Command::new("notify-send").args(["-t", "5000", "--", "File uploaded", &format!("{url}\ncopied to clipboard")]).status();
 }
 
@@ -283,7 +297,7 @@ fn main() {
         ["-l"] => list(None),
         ["-l", n] => list(Some(n)),
         ["-e"] => {
-            let ed = env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+            let ed = env::var("EDITOR").unwrap_or_else(|_| if cfg!(windows) { "notepad".into() } else { "vi".into() });
             let _ = Command::new(ed).arg(log_path()).status();
         }
         ["-u", f] | [f] if !f.starts_with('-') || a[0] == "-u" => upload(f),

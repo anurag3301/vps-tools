@@ -35,7 +35,7 @@ phone app ──HTTPS POST (ciphertext)──► relay (VPS, Caddy TLS) ◄─�
 |---|---|
 | `crates/proto` | Shared crypto/protocol (HKDF, ChaCha20-Poly1305, HMAC request signing) |
 | `crates/relay` | `noti-relay`: closed, in-memory relay (axum) |
-| `crates/daemon` | `noti-daemon`: pair / receive / `test-send` |
+| `crates/daemon` | `noti-daemon`: pair / share / join / run / install / `test-send` (Linux + Windows) |
 | `crates/upload` | `upload` client |
 | `crates/store` | Shared upload store (quota, retention, gc) used by the relay and the ssh receiver |
 | `crates/upload-recv` | `noti-upload-recv`: server-side receiver, list/delete, gc |
@@ -77,6 +77,35 @@ noti-daemon test-send "Hello" "from the CLI"      # acts as the phone
 Phone: install `noti-debug.apk` (`adb install`), scan the QR, grant *notification access*, set battery to *Unrestricted* (Samsung: Settings → Apps → Noti → Battery).
 
 Android build: `cd android && ANDROID_HOME=~/Android ./gradlew assembleDebug`. Crypto interop with Rust is covered by `./gradlew testDebugUnitTest`.
+
+## Building the client tools only
+Only `noti-daemon` and `upload` (the PC-side tools) need to be built on a PC; no server crates, no Android:
+```sh
+cargo build --release -p daemon -p upload      # Linux / macOS-ish
+cargo build --release -p daemon                # just the notification client
+```
+```powershell
+# Windows (install Rust via rustup, MSVC build tools)
+cargo build --release -p daemon -p upload
+# or cross-compile from Linux: apt install gcc-mingw-w64-x86-64 && rustup target add x86_64-pc-windows-gnu
+#   cargo build --release -p daemon -p upload --target x86_64-pc-windows-gnu
+```
+Server crates (`relay`, `upload-recv`, `store`) are Linux-only.
+
+### Windows notes
+- `noti-daemon` shows toasts via PowerShell (`long` duration, ~25 s; Windows only offers ~5 s or ~25 s). Config in `%APPDATA%\noti`, state in `%LOCALAPPDATA%\noti`.
+- `noti-daemon install` adds a per-user autostart (HKCU Run key); on Linux it installs and starts the systemd user unit.
+- `upload` needs OpenSSH client (`ssh`), `curl` (bundled with Windows 10+) and `fzf` for list/rm; the link is copied with `clip`. `~/.upload_list` is `%USERPROFILE%\.upload_list`.
+- The Windows build is cross-compiled and type-checked but has not been run on a real Windows machine.
+
+## Several PCs
+Each PC has its **own queue** on the relay (a 5-message ring buffer each, up to 8 PCs per channel), so one PC being off never affects another.
+```sh
+noti-daemon share                 # on a paired PC: prints a QR/link (contains the secret)
+noti-daemon join '<link>'         # on the new PC
+noti-daemon install               # start at login
+```
+PCs register on their first authenticated poll (`/v1/poll?dev=<id>`). Configs from before this feature use the `default` queue.
 
 ## Revoke
 `ssh vps 'sudo -u noti noti-relay remove --channels /var/lib/noti-relay/channels.txt <channel-prefix>'` (picked up within 10 s), then `rm ~/.config/noti/config.json` and unpair in the app.
