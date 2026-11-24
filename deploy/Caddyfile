@@ -1,11 +1,11 @@
-# Caddy only fronts the relay, on :8443. The main site (gunicorn :443, redirect :80) is untouched.
+# Caddy only fronts the relay, on :8443 (and :53/tcp, the only port some office networks let through). The main site (gunicorn :443, redirect :80) is untouched.
 # TLS cert is issued/renewed by certbot (webroot) and copied to /etc/caddy/certs by caddy-cert-hook.sh.
 {
 	auto_https off
 	admin off
 }
 
-https://notify.anurag3301.dev:8443 {
+https://notify.anurag3301.dev:8443, https://notify.anurag3301.dev:53 {
 	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
 
 	# Only the relay's routes are forwarded; everything else is dropped at the edge.

@@ -132,7 +132,7 @@ fn show(n: &Notification) {
     let icon = icon_path(&n.pkg).filter(|p| p.exists()).map(|p| p.display().to_string()).unwrap_or_else(|| "phone".into());
     let title = if n.title.is_empty() { n.app.clone() } else { format!("{}: {}", n.app, n.title) };
     let _ = Command::new("notify-send")
-        .args(["-a", "noti", "-i", &icon, "--"])
+        .args(["-a", "noti", "-t", "10000", "-i", &icon, "--"])
         .arg(escape(&title))
         .arg(escape(&n.text))
         .status();
