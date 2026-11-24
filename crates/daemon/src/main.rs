@@ -1,10 +1,12 @@
 //! noti-daemon: pairs with the phone and shows relayed notifications on this laptop.
 
+mod platform;
+
+use platform::write_private;
 use proto::{Notification, Role};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -14,27 +16,22 @@ use std::{
 struct Config {
     relay: String,
     secret_hex: String,
-}
-
-fn dir(base: &str, fallback: &str) -> PathBuf {
-    let d = std::env::var_os(base)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").expect("HOME")).join(fallback));
-    d.join("noti")
+    /// Names this PC's own queue on the relay. Absent in configs from before multi-PC support,
+    /// which map to the relay's `default` queue.
+    #[serde(default)]
+    device: Option<String>,
 }
 
 fn config_path() -> PathBuf {
-    dir("XDG_CONFIG_HOME", ".config").join("config.json")
+    platform::config_dir().join("config.json")
 }
 
 fn state_path() -> PathBuf {
-    dir("XDG_STATE_HOME", ".local/state").join("after")
+    platform::state_dir().join("after")
 }
 
-fn write_private(p: &PathBuf, data: &str) {
-    fs::create_dir_all(p.parent().unwrap()).expect("mkdir");
-    fs::write(p, data).expect("write");
-    fs::set_permissions(p, fs::Permissions::from_mode(0o600)).expect("chmod");
+fn new_device_id() -> String {
+    hex::encode(&proto::new_secret()[..6])
 }
 
 fn load_config() -> (Config, [u8; 32]) {
@@ -59,7 +56,7 @@ fn pair(relay: &str, ssh: Option<&str>) {
     }
     let secret = proto::new_secret();
     let keys = proto::derive(&secret);
-    let cfg = Config { relay: relay.to_string(), secret_hex: hex::encode(secret) };
+    let cfg = Config { relay: relay.to_string(), secret_hex: hex::encode(secret), device: Some(new_device_id()) };
     write_private(&config_path(), &serde_json::to_string_pretty(&cfg).unwrap());
 
     let uri = proto::pairing_uri(relay, &secret);
@@ -87,7 +84,36 @@ fn pair(relay: &str, ssh: Option<&str>) {
     if let Ok(code) = qrcode::QrCode::new(uri.as_bytes()) {
         println!("{}", code.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build());
     }
-    println!("{uri}\n\n3) Start receiving: noti-daemon run");
+    println!("{uri}\n\n3) Start receiving: noti-daemon run   (or `noti-daemon install` to start at login)\n   Add another PC later with: noti-daemon share");
+}
+
+/// Prints this pairing as a QR/link so another PC can `join` it. Each PC then gets its own queue.
+fn share() {
+    let (cfg, secret) = load_config();
+    let uri = proto::pairing_uri(&cfg.relay, &secret);
+    println!("On the other PC run:  noti-daemon join '<link>'\nThe link contains the secret; do not share it.\n");
+    if let Ok(code) = qrcode::QrCode::new(uri.as_bytes()) {
+        println!("{}", code.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build());
+    }
+    println!("{uri}");
+}
+
+fn join(uri: &str) {
+    if config_path().exists() {
+        eprintln!("already paired ({}); delete it to join another pairing", config_path().display());
+        std::process::exit(1);
+    }
+    let (relay, secret) = proto::parse_pairing_uri(uri).unwrap_or_else(|e| {
+        eprintln!("bad pairing link: {e}");
+        std::process::exit(1)
+    });
+    if !relay.starts_with("https://") {
+        eprintln!("relay must be https://");
+        std::process::exit(1);
+    }
+    let cfg = Config { relay, secret_hex: hex::encode(secret), device: Some(new_device_id()) };
+    write_private(&config_path(), &serde_json::to_string_pretty(&cfg).unwrap());
+    println!("joined. Start receiving: noti-daemon run   (or `noti-daemon install` to start at login)");
 }
 
 fn now_secs() -> i64 {
@@ -104,12 +130,8 @@ struct Msg {
     data: String,
 }
 
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
 fn icon_dir() -> PathBuf {
-    dir("XDG_CACHE_HOME", ".cache").join("icons")
+    platform::cache_dir().join("icons")
 }
 
 fn icon_path(pkg: &str) -> Option<PathBuf> {
@@ -129,13 +151,9 @@ fn store_icon(n: &Notification) {
 }
 
 fn show(n: &Notification) {
-    let icon = icon_path(&n.pkg).filter(|p| p.exists()).map(|p| p.display().to_string()).unwrap_or_else(|| "phone".into());
+    let icon = icon_path(&n.pkg).filter(|p| p.exists()).map(|p| p.display().to_string());
     let title = if n.title.is_empty() { n.app.clone() } else { format!("{}: {}", n.app, n.title) };
-    let _ = Command::new("notify-send")
-        .args(["-a", "noti", "-t", "10000", "-i", &icon, "--"])
-        .arg(escape(&title))
-        .arg(escape(&n.text))
-        .status();
+    platform::show(&title, &n.text, icon.as_deref());
 }
 
 fn run() {
@@ -147,10 +165,13 @@ fn run() {
     let mut after: u64 = fs::read_to_string(state_path()).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let mut backoff = 1u64;
     let mut seen_ids: Vec<String> = Vec::new();
-    eprintln!("noti-daemon: connected to {} (channel {}…)", cfg.relay, &chan[..8]);
+    eprintln!("noti-daemon: connected to {} (channel {}…, device {})", cfg.relay, &chan[..8], cfg.device.as_deref().unwrap_or("default"));
 
     loop {
-        let pq = format!("/v1/poll?after={after}&wait=25");
+        let pq = match &cfg.device {
+            Some(d) => format!("/v1/poll?after={after}&wait=25&dev={d}"),
+            None => format!("/v1/poll?after={after}&wait=25"),
+        };
         let ts = now_secs();
         let nonce = proto::new_nonce();
         let sig = proto::sign(key, &proto::signing_input("GET", &pq, ts, &nonce, b""));
@@ -230,7 +251,13 @@ fn main() {
             None => eprintln!("usage: noti-daemon pair --relay https://notify.example.com [--ssh host]"),
         },
         Some("run") => run(),
+        Some("share") => share(),
+        Some("join") if args.len() == 2 => join(&args[1]),
+        Some("install") => match platform::install_autostart() {
+            Ok(m) => println!("{m}"),
+            Err(e) => eprintln!("install failed: {e}"),
+        },
         Some("test-send") if args.len() == 3 => test_send(&args[1], &args[2]),
-        _ => eprintln!("usage: noti-daemon pair --relay <url> | run"),
+        _ => eprintln!("usage: noti-daemon pair --relay <url> [--ssh host] | share | join <link> | run | install | test-send <title> <text>"),
     }
 }

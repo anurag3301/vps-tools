@@ -32,6 +32,10 @@ const QUEUE_CAP: usize = 5;
 const TTL: Duration = Duration::from_secs(24 * 3600);
 const SENDS_PER_MIN: usize = 120;
 const MAX_POLLERS: usize = 2;
+const MAX_DEVS: usize = 8;
+const DEV_IDLE: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Name of the placeholder queue that holds messages sent before any laptop has ever polled.
+const PENDING_DEV: &str = "";
 const MAX_WAIT: u64 = 30;
 const FAIL_LIMIT: u32 = 10;
 const FAIL_WINDOW: Duration = Duration::from_secs(600);
@@ -53,32 +57,42 @@ struct ChanKeys {
     laptop: [u8; 32],
 }
 
-struct Queue {
+/// One laptop's ring buffer. Every paired laptop has its own, so a laptop that is off or slow
+/// never loses (or duplicates) messages because of another one.
+struct Dev {
     msgs: VecDeque<(u64, Instant, String)>,
     next_seq: u64,
     notify: Arc<Notify>,
+    pollers: usize,
+    last_seen: Instant,
+}
+
+impl Dev {
+    fn new(now: Instant) -> Self {
+        // Time-based start keeps seq monotonic across relay restarts.
+        let ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        Dev { msgs: VecDeque::new(), next_seq: ms, notify: Arc::new(Notify::new()), pollers: 0, last_seen: now }
+    }
+}
+
+/// Per-channel state: replay/rate-limit bookkeeping plus one `Dev` per laptop.
+struct Queue {
     nonces: HashMap<String, Instant>,
     sends: VecDeque<Instant>,
-    pollers: usize,
+    devs: HashMap<String, Dev>,
 }
 
 impl Queue {
     fn new() -> Self {
-        // Time-based start keeps seq monotonic across relay restarts.
-        let ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        Queue {
-            msgs: VecDeque::new(),
-            next_seq: ms,
-            notify: Arc::new(Notify::new()),
-            nonces: HashMap::new(),
-            sends: VecDeque::new(),
-            pollers: 0,
-        }
+        Queue { nonces: HashMap::new(), sends: VecDeque::new(), devs: HashMap::new() }
     }
     fn expire(&mut self, now: Instant) {
-        while self.msgs.front().is_some_and(|m| now.duration_since(m.1) > TTL) {
-            self.msgs.pop_front();
+        for d in self.devs.values_mut() {
+            while d.msgs.front().is_some_and(|m| now.duration_since(m.1) > TTL) {
+                d.msgs.pop_front();
+            }
         }
+        self.devs.retain(|_, d| d.pollers > 0 || now.duration_since(d.last_seen) < DEV_IDLE);
         self.nonces.retain(|_, t| now.duration_since(*t) < NONCE_TTL);
     }
 }
@@ -258,13 +272,19 @@ async fn send(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     q.sends.push_back(now);
-    let seq = q.next_seq;
-    q.next_seq += 1;
-    q.msgs.push_back((seq, now, data));
-    while q.msgs.len() > QUEUE_CAP {
-        q.msgs.pop_front();
+    if q.devs.is_empty() {
+        q.devs.insert(PENDING_DEV.to_string(), Dev::new(now));
     }
-    q.notify.notify_waiters();
+    let mut seq = 0;
+    for d in q.devs.values_mut() {
+        seq = d.next_seq;
+        d.next_seq += 1;
+        d.msgs.push_back((seq, now, data.clone()));
+        while d.msgs.len() > QUEUE_CAP {
+            d.msgs.pop_front();
+        }
+        d.notify.notify_waiters();
+    }
     Ok(Json(SendResp { seq }))
 }
 
@@ -272,6 +292,7 @@ async fn send(
 struct PollQ {
     after: Option<u64>,
     wait: Option<u64>,
+    dev: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -288,13 +309,19 @@ struct PollResp {
 struct PollerGuard {
     app: Shared,
     chan: String,
+    dev: String,
 }
 impl Drop for PollerGuard {
     fn drop(&mut self) {
-        if let Some(q) = self.app.queues.lock().unwrap().get_mut(&self.chan) {
-            q.pollers = q.pollers.saturating_sub(1);
+        if let Some(d) = self.app.queues.lock().unwrap().get_mut(&self.chan).and_then(|q| q.devs.get_mut(&self.dev)) {
+            d.pollers = d.pollers.saturating_sub(1);
+            d.last_seen = Instant::now();
         }
     }
+}
+
+fn valid_dev(s: &str) -> bool {
+    (1..=32).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// `after` doubles as the acknowledgement: everything <= after is deleted.
@@ -308,27 +335,42 @@ async fn poll(
 ) -> Result<Json<PollResp>, StatusCode> {
     let ip = client_ip(peer, &headers);
     let chan = app.authenticate(ip, &headers, &method, &uri, b"", Role::Laptop)?;
+    let dev = pq.dev.unwrap_or_else(|| "default".into());
+    if !valid_dev(&dev) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let after = pq.after.unwrap_or(0);
     let wait = Duration::from_secs(pq.wait.unwrap_or(0).min(MAX_WAIT));
 
     let notify = {
         let mut qs = app.queues.lock().unwrap();
         let q = qs.get_mut(&chan).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-        if q.pollers >= MAX_POLLERS {
+        let now = Instant::now();
+        if !q.devs.contains_key(&dev) {
+            if q.devs.len() >= MAX_DEVS {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            // The first laptop inherits anything sent before any laptop had polled.
+            let d = q.devs.remove(PENDING_DEV).unwrap_or_else(|| Dev::new(now));
+            q.devs.insert(dev.clone(), d);
+        }
+        let d = q.devs.get_mut(&dev).unwrap();
+        if d.pollers >= MAX_POLLERS {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        q.pollers += 1;
-        q.notify.clone()
+        d.pollers += 1;
+        d.last_seen = now;
+        d.notify.clone()
     };
-    let _guard = PollerGuard { app: app.clone(), chan: chan.clone() };
+    let _guard = PollerGuard { app: app.clone(), chan: chan.clone(), dev: dev.clone() };
 
     let collect = |app: &App| -> Vec<Msg> {
         let mut qs = app.queues.lock().unwrap();
-        let Some(q) = qs.get_mut(&chan) else { return vec![] };
-        while q.msgs.front().is_some_and(|m| m.0 <= after) {
-            q.msgs.pop_front();
+        let Some(d) = qs.get_mut(&chan).and_then(|q| q.devs.get_mut(&dev)) else { return vec![] };
+        while d.msgs.front().is_some_and(|m| m.0 <= after) {
+            d.msgs.pop_front();
         }
-        q.msgs.iter().take(50).map(|m| Msg { seq: m.0, data: m.2.clone() }).collect()
+        d.msgs.iter().take(50).map(|m| Msg { seq: m.0, data: m.2.clone() }).collect()
     };
 
     // Register for wakeups before the first check so a send in between is not lost.
@@ -793,6 +835,53 @@ mod tests {
         let b = axum::body::to_bytes(p2.into_body(), 1 << 20).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(v["messages"].as_array().unwrap().is_empty());
+    }
+
+    async fn poll_dev(r: &Router, keys: &proto::Keys, dev: &str, after: u64, nonce: &str) -> Vec<(u64, String)> {
+        let pq = format!("/v1/poll?after={after}&dev={dev}");
+        let p = oneshot(r.clone(), req(keys, Role::Laptop, "GET", &pq, "", now_secs(), nonce)).await;
+        assert_eq!(p.status(), 200);
+        json(p).await["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m["seq"].as_u64().unwrap(), m["data"].as_str().unwrap().to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_laptop_has_its_own_ring_queue() {
+        let keys = proto::derive(&proto::new_secret());
+        let r = router(app_with(&keys));
+        let send = |i: usize| {
+            let r = r.clone();
+            let keys = &keys;
+            async move {
+                let b = format!("m{i}");
+                let s = oneshot(r, req(keys, Role::Phone, "POST", "/v1/send", &b, now_secs(), &format!("s{i}"))).await;
+                assert_eq!(s.status(), 200);
+            }
+        };
+        send(0).await; // before any laptop polled: held for the first one
+        let a = poll_dev(&r, &keys, "pc-a", 0, "p1").await;
+        assert_eq!(a.iter().map(|m| m.1.as_str()).collect::<Vec<_>>(), ["m0"]);
+        let b = poll_dev(&r, &keys, "pc-b", 0, "p2").await; // joins later: starts empty
+        assert!(b.is_empty());
+
+        for i in 1..=8 {
+            send(i).await;
+        }
+        // pc-a acked m0 above, pc-b never acks; each keeps only its newest 5, independently
+        let b = poll_dev(&r, &keys, "pc-b", 0, "p3").await;
+        assert_eq!(b.iter().map(|m| m.1.as_str()).collect::<Vec<_>>(), ["m4", "m5", "m6", "m7", "m8"]);
+        let a = poll_dev(&r, &keys, "pc-a", a[0].0, "p4").await;
+        assert_eq!(a.len(), 5);
+        // acking on one does not consume the other's
+        poll_dev(&r, &keys, "pc-a", a[4].0, "p5").await;
+        assert_eq!(poll_dev(&r, &keys, "pc-b", 0, "p6").await.len(), 5);
+        // bad device id
+        let bad = oneshot(r.clone(), req(&keys, Role::Laptop, "GET", "/v1/poll?dev=a%2Fb", "", now_secs(), "p7")).await;
+        assert_eq!(bad.status(), 400);
     }
 
     #[tokio::test]
