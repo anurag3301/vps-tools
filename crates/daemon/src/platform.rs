@@ -65,21 +65,33 @@ pub fn show(title: &str, text: &str, icon: Option<&str>) {
         let image = icon
             .map(|p| format!("<image placement=\"appLogoOverride\" src=\"{}\"/>", xml_escape(&format!("file:///{}", p.replace('\\', "/")))))
             .unwrap_or_default();
-        // `long` keeps the toast on screen ~25 s (Windows only offers ~5 s or ~25 s); it also stays in the Action Center.
+        // `long` keeps the toast on screen ~25 s (Windows only offers ~5 s or ~25 s); ExpirationTime below removes it from the Action Center afterwards.
         let xml = format!(
             "<toast duration=\"long\"><visual><binding template=\"ToastGeneric\">{image}<text>{}</text><text>{}</text></binding></visual></toast>",
             xml_escape(title),
             xml_escape(text)
         );
         // The XML travels in an environment variable so no text is ever parsed as PowerShell code.
-        const SCRIPT: &str = "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
+        // Own app identity, so toasts say "noti" with our icon instead of "Windows PowerShell".
+        let app_icon = cache_dir().join("app.png");
+        if !app_icon.exists() {
+            let _ = fs::create_dir_all(cache_dir());
+            let _ = fs::write(&app_icon, include_bytes!("../app-icon.png"));
+        }
+        const SCRIPT: &str = "$k = 'HKCU:\\Software\\Classes\\AppUserModelId\\noti.vps-tools'; \
+            New-Item -Path $k -Force | Out-Null; \
+            New-ItemProperty -Path $k -Name DisplayName -Value 'noti' -PropertyType String -Force | Out-Null; \
+            New-ItemProperty -Path $k -Name IconUri -Value $env:NOTI_APP_ICON -PropertyType String -Force | Out-Null; \
+            [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
             [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; \
             $x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml($env:NOTI_TOAST_XML); \
             $t = [Windows.UI.Notifications.ToastNotification]::new($x); \
-            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($t)";
+            $t.ExpirationTime = [DateTimeOffset]::Now.AddSeconds(60); \
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('noti.vps-tools').Show($t)";
         let _ = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", SCRIPT])
             .env("NOTI_TOAST_XML", xml)
+            .env("NOTI_APP_ICON", &app_icon)
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .status();
     }
