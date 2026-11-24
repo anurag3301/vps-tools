@@ -22,15 +22,12 @@ OPTIONS:
     rm           browse uploads (largest first, fzf); Enter deletes after y/n
     clear        delete ALL uploads on the server after y/n
     setup <user@host> [base-url]
-                 one-time: save the upload account (e.g. upload@example.com); base-url
-                 defaults to https://<host>/f
-    register <admin@host>
-                 one-time: authorize this PC's ssh public key on the server, using your
-                 normal (sudo-capable) ssh login
+                 one-time: save your ssh login (e.g. me@example.com); base-url defaults
+                 to https://<host>/f
     -h, --help   this help
 
 ENV (override the saved setup):
-    UPLOAD_HOST  ssh destination, e.g. upload@example.com
+    UPLOAD_HOST  ssh login, e.g. me@example.com
     UPLOAD_BASE_URL  public download prefix
     UPLOAD_LOG   log file (default: ~/.upload_list)
 
@@ -88,7 +85,7 @@ fn upload(path: &str) {
 
     eprintln!("Uploading {file_name} ({} KiB)", size.div_ceil(1024));
     let mut ssh = Command::new("ssh")
-        .args(["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", &host, &format!("put {size} {name}")])
+        .args(["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", &host, &recv(&format!("put {size} {name}"))])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -176,14 +173,14 @@ fn host() -> String {
     env::var("UPLOAD_HOST")
         .ok()
         .or_else(|| saved("host"))
-        .unwrap_or_else(|| die("not configured, run: upload setup <user@host>   (e.g. upload@example.com)"))
+        .unwrap_or_else(|| die("not configured, run: upload setup <user@host>   (e.g. me@example.com)"))
 }
 
 fn setup(dest: &str, base: Option<&str>) {
     let Some((user, h)) = dest.split_once('@').filter(|(u, h)| !u.is_empty() && !h.is_empty()) else {
         die("expected user@host")
     };
-    if dest.chars().any(|c| c.is_whitespace() || c == '\'' || c == '"') {
+    if !dest.chars().all(|c| c.is_ascii_alphanumeric() || "@._-".contains(c)) {
         die("invalid destination");
     }
     let base = base.map(|b| b.trim_end_matches('/').to_string()).unwrap_or_else(|| format!("https://{h}/f"));
@@ -191,40 +188,21 @@ fn setup(dest: &str, base: Option<&str>) {
     let _ = fs::create_dir_all(path.parent().unwrap());
     fs::write(&path, format!("host={user}@{h}\nbase_url={base}\n")).unwrap_or_else(|e| die(&format!("cannot write {}: {e}", path.display())));
     eprintln!("saved {} (uploads as {user}@{h}, links under {base})", path.display());
-    eprintln!("if the server refuses your key, run: upload register <your-login>@{h}");
 }
 
-/// Appends this PC's public key to the restricted upload account, via the admin's normal ssh login.
-fn register(admin: &str) {
-    let dest = host();
-    let Some(user) = dest.split_once('@').map(|(u, _)| u.to_string()) else { die("bad saved host") };
-    let ssh_dir = home().join(".ssh");
-    let key = ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"]
-        .iter()
-        .find_map(|n| fs::read_to_string(ssh_dir.join(n)).ok())
-        .unwrap_or_else(|| die("no public key in ~/.ssh, run: ssh-keygen -t ed25519"));
-    let key = key.trim();
-    if key.contains('\n') || !key.starts_with("ssh-") && !key.starts_with("ecdsa-") || key.contains('"') || key.contains('\'') {
-        die("unexpected public key format");
-    }
+/// The remote command line: the server-side receiver, told the public URL prefix.
+fn recv(cmd: &str) -> String {
     let base = base_url();
-    let line = format!(
-        "restrict,command=\"/usr/local/bin/noti-upload-recv --root /var/lib/noti-upload --base-url {base}\" {key}"
-    );
-    let script = format!(
-        "f=$(getent passwd {user} | cut -d: -f6)/.ssh/authorized_keys; \
-         if sudo grep -qF '{key}' \"$f\"; then echo already registered; else echo '{line}' | sudo tee -a \"$f\" >/dev/null && echo registered; fi"
-    );
-    let st = Command::new("ssh").args([admin, &script]).status().unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")));
-    if !st.success() {
-        die("registration failed");
+    if !base.chars().all(|c| c.is_ascii_alphanumeric() || ":/._-".contains(c)) {
+        die("base url contains unsupported characters");
     }
+    format!("noti-upload-recv --base-url {base} {cmd}")
 }
 
 /// Runs a command on the server through the restricted key; returns stdout.
 fn remote(cmd: &str) -> String {
     let out = Command::new("ssh")
-        .args(["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", &host(), cmd])
+        .args(["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", &host(), &recv(cmd)])
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")));
@@ -361,7 +339,6 @@ fn main() {
         [] | ["-h"] | ["--help"] => println!("{HELP}"),
         ["setup", d] => setup(d, None),
         ["setup", d, b] => setup(d, Some(b)),
-        ["register", a] => register(a),
         ["stat"] => stat(),
         ["list"] | ["ls"] => browse_download(),
         ["rm"] => browse_delete(),

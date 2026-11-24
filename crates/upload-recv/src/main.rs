@@ -1,8 +1,8 @@
 //! noti-upload-recv: server side of `upload`.
 //!
-//! Runs as the forced command of the restricted `upload` ssh user, so access control is
-//! simply "is your key in authorized_keys". The client sends `put <size> <name>` (or
-//! stat/list/del/clear) as the ssh command and streams the file on stdin.
+//! The client runs it over ssh as a normal login (`ssh user@host noti-upload-recv put <size> <name>`,
+//! or stat/list/del/clear), so access control is simply "can you ssh in". The file streams on stdin.
+//! It also still honours SSH_ORIGINAL_COMMAND for use as a forced command.
 //! Also provides `gc` to delete expired files.
 
 use std::{
@@ -17,9 +17,9 @@ fn fail(msg: &str) -> ! {
     exit(1)
 }
 
-fn receive(root: &Path, base_url: &str) {
+fn receive(root: &Path, base_url: &str, words: &[String]) {
     let cmd = std::env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default();
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let parts: Vec<&str> = if words.is_empty() { cmd.split_whitespace().collect() } else { words.iter().map(String::as_str).collect() };
     match parts[..] {
         ["stat"] => return stat(root),
         ["list"] => return list(root),
@@ -70,17 +70,18 @@ fn main() {
     let mut root = PathBuf::from("/var/lib/noti-upload");
     let mut base_url = "https://anurag3301.dev/f".to_string();
     let mut sub = "receive";
+    let mut words: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--root" => root = it.next().unwrap_or_else(|| fail("--root needs a value")).into(),
             "--base-url" => base_url = it.next().unwrap_or_else(|| fail("--base-url needs a value")).clone(),
-            "gc" => sub = "gc",
-            other => fail(&format!("unknown argument {other}")),
+            "gc" if words.is_empty() => sub = "gc",
+            other => words.push(other.to_string()),
         }
     }
     match sub {
         "gc" => println!("removed {} expired upload(s)", store::gc(&root)),
-        _ => receive(&root, &base_url),
+        _ => receive(&root, &base_url, &words),
     }
 }

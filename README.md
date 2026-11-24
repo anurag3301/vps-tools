@@ -7,8 +7,8 @@ Small, security-minded tools that run on my VPS (or talk to it):
 
 ## upload
 
-`upload <file>` streams the file over ssh to a restricted `upload` user (forced command
-`noti-upload-recv`), which stores it in `/var/lib/noti-upload/files/<id>/<name>`. The site serves it
+`upload <file>` streams the file over ssh (your normal login; auth = your ssh key) to
+`noti-upload-recv`, which stores it in `/var/lib/noti-upload/files/<id>/<name>`. The site serves it
 read-only at `https://anurag3301.dev/f/<id>/<name>` (Flask route, nosniff + sandbox CSP, risky types
 forced to download). It prints the link and a QR, copies it, and logs to `~/.upload_list`.
 
@@ -99,12 +99,11 @@ Server crates (`relay`, `upload-recv`, `store`) are Linux-only.
 - The Windows build is cross-compiled and type-checked but has not been run on a real Windows machine.
 
 ### First run of `upload` on a new PC
-The upload account is a restricted, shell-less user (each key can only run the receiver), so nothing is hardcoded; configure once:
+`upload` just uses your normal ssh login (any PC that can `ssh` to the VPS can upload); it runs `noti-upload-recv` there. Configure once:
 ```sh
-upload setup upload@example.com            # saved in ~/.config/upload/config (%APPDATA%\\upload\\config on Windows)
-upload register you@example.com            # authorizes this PC's ~/.ssh/id_*.pub, via your normal ssh login (needs sudo on the VPS)
+upload setup you@example.com        # saved in ~/.config/upload/config (%APPDATA%\\upload\\config on Windows)
 ```
-`UPLOAD_HOST` / `UPLOAD_BASE_URL` override the saved values.
+`UPLOAD_HOST` / `UPLOAD_BASE_URL` override the saved values. On the server the login user must be in the `upload` group (`usermod -aG upload you`) and `noti-upload-recv` installed in `/usr/local/bin`.
 
 ## Several PCs
 Each PC has its **own queue** on the relay (a 5-message ring buffer each, up to 8 PCs per channel), so one PC being off never affects another.
