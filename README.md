@@ -1,5 +1,7 @@
 # vps-tools
 
+> Setting this up from scratch (or handing it to an AI agent)? Follow [SETUP.md](SETUP.md).
+
 Small, security-minded tools that run on my VPS (or talk to it):
 
 1. **noti** — end-to-end encrypted notification relay: Android phone → VPS relay → Linux laptop.

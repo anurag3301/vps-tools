@@ -10,6 +10,7 @@ sudo ufw allow 22/tcp
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw allow 8443/tcp  # relay (Caddy)
+sudo ufw allow 53/tcp    # relay again, for office networks that only let this through
 sudo ufw --force enable
 sudo systemctl enable --now fail2ban
 sudo dpkg-reconfigure -f noninteractive unattended-upgrades
