@@ -28,7 +28,7 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, sync::{Notify, Semaphore}};
 
-const QUEUE_CAP: usize = 500;
+const QUEUE_CAP: usize = 5;
 const TTL: Duration = Duration::from_secs(24 * 3600);
 const SENDS_PER_MIN: usize = 120;
 const MAX_POLLERS: usize = 2;

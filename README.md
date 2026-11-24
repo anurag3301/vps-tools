@@ -62,7 +62,7 @@ emulator host only and is never shipped.
 - **E2E:** one 32-byte secret is created on the laptop and handed to the phone via QR. Payloads are ChaCha20-Poly1305 sealed (channel id as AAD). The relay never has the key, so it only sees ciphertext.
 - **Closed relay:** only channels listed in `/var/lib/noti-relay/channels.txt` exist. No open registration.
 - **Auth:** every request carries `x-chan/x-ts/x-nonce/x-sig` (HMAC-SHA256 over method, path+query, ts, nonce, body hash). Separate keys per role (phone can send, laptop can poll). ±60 s window plus nonce replay cache.
-- **Abuse limits:** 16 KB body, 120 sends/min/channel, 500-message queue, 24 h TTL, 10 auth failures → 10 min IP lockout, max 2 pollers per channel.
+- **Abuse limits:** 16 KB body, 120 sends/min/channel, 5-message ring-buffer queue (oldest dropped), 24 h TTL, 10 auth failures → 10 min IP lockout, max 2 pollers per channel.
 - **No persistence** of messages; relay runs as an unprivileged `noti` user in a sandboxed systemd unit, loopback-only behind Caddy (port 8443; the main site is untouched).
 - The pairing secret on the phone is wrapped by an Android Keystore key; on the laptop it's `~/.config/noti/config.json` (0600).
 
