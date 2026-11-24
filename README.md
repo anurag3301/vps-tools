@@ -98,6 +98,14 @@ Server crates (`relay`, `upload-recv`, `store`) are Linux-only.
 - `upload` needs OpenSSH client (`ssh`), `curl` (bundled with Windows 10+) and `fzf` for list/rm; the link is copied with `clip`. `~/.upload_list` is `%USERPROFILE%\.upload_list`.
 - The Windows build is cross-compiled and type-checked but has not been run on a real Windows machine.
 
+### First run of `upload` on a new PC
+The upload account is a restricted, shell-less user (each key can only run the receiver), so nothing is hardcoded; configure once:
+```sh
+upload setup upload@example.com            # saved in ~/.config/upload/config (%APPDATA%\\upload\\config on Windows)
+upload register you@example.com            # authorizes this PC's ~/.ssh/id_*.pub, via your normal ssh login (needs sudo on the VPS)
+```
+`UPLOAD_HOST` / `UPLOAD_BASE_URL` override the saved values.
+
 ## Several PCs
 Each PC has its **own queue** on the relay (a 5-message ring buffer each, up to 8 PCs per channel), so one PC being off never affects another.
 ```sh

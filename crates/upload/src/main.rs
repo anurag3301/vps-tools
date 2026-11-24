@@ -21,10 +21,17 @@ OPTIONS:
     list         browse uploads on the server (newest first, fzf); Enter downloads
     rm           browse uploads (largest first, fzf); Enter deletes after y/n
     clear        delete ALL uploads on the server after y/n
+    setup <user@host> [base-url]
+                 one-time: save the upload account (e.g. upload@example.com); base-url
+                 defaults to https://<host>/f
+    register <admin@host>
+                 one-time: authorize this PC's ssh public key on the server, using your
+                 normal (sudo-capable) ssh login
     -h, --help   this help
 
-ENV:
-    UPLOAD_HOST  ssh destination (default: upload@anurag3301.dev)
+ENV (override the saved setup):
+    UPLOAD_HOST  ssh destination, e.g. upload@example.com
+    UPLOAD_BASE_URL  public download prefix
     UPLOAD_LOG   log file (default: ~/.upload_list)
 
 Max 256 MB. Bigger files expire sooner (90 days for tiny files down to 10 days).";
@@ -151,8 +158,67 @@ fn clipboard_and_notify(url: &str) {
     let _ = Command::new("notify-send").args(["-t", "5000", "--", "File uploaded", &format!("{url}\ncopied to clipboard")]).status();
 }
 
+fn config_path() -> PathBuf {
+    let base = if cfg!(windows) {
+        PathBuf::from(env::var_os("APPDATA").unwrap_or_default())
+    } else {
+        env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".config"))
+    };
+    base.join("upload").join("config")
+}
+
+fn saved(key: &str) -> Option<String> {
+    let text = fs::read_to_string(config_path()).ok()?;
+    text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(|v| v.trim().to_string())).filter(|v| !v.is_empty())
+}
+
 fn host() -> String {
-    env::var("UPLOAD_HOST").unwrap_or_else(|_| "upload@anurag3301.dev".into())
+    env::var("UPLOAD_HOST")
+        .ok()
+        .or_else(|| saved("host"))
+        .unwrap_or_else(|| die("not configured, run: upload setup <user@host>   (e.g. upload@example.com)"))
+}
+
+fn setup(dest: &str, base: Option<&str>) {
+    let Some((user, h)) = dest.split_once('@').filter(|(u, h)| !u.is_empty() && !h.is_empty()) else {
+        die("expected user@host")
+    };
+    if dest.chars().any(|c| c.is_whitespace() || c == '\'' || c == '"') {
+        die("invalid destination");
+    }
+    let base = base.map(|b| b.trim_end_matches('/').to_string()).unwrap_or_else(|| format!("https://{h}/f"));
+    let path = config_path();
+    let _ = fs::create_dir_all(path.parent().unwrap());
+    fs::write(&path, format!("host={user}@{h}\nbase_url={base}\n")).unwrap_or_else(|e| die(&format!("cannot write {}: {e}", path.display())));
+    eprintln!("saved {} (uploads as {user}@{h}, links under {base})", path.display());
+    eprintln!("if the server refuses your key, run: upload register <your-login>@{h}");
+}
+
+/// Appends this PC's public key to the restricted upload account, via the admin's normal ssh login.
+fn register(admin: &str) {
+    let dest = host();
+    let Some(user) = dest.split_once('@').map(|(u, _)| u.to_string()) else { die("bad saved host") };
+    let ssh_dir = home().join(".ssh");
+    let key = ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"]
+        .iter()
+        .find_map(|n| fs::read_to_string(ssh_dir.join(n)).ok())
+        .unwrap_or_else(|| die("no public key in ~/.ssh, run: ssh-keygen -t ed25519"));
+    let key = key.trim();
+    if key.contains('\n') || !key.starts_with("ssh-") && !key.starts_with("ecdsa-") || key.contains('"') || key.contains('\'') {
+        die("unexpected public key format");
+    }
+    let base = base_url();
+    let line = format!(
+        "restrict,command=\"/usr/local/bin/noti-upload-recv --root /var/lib/noti-upload --base-url {base}\" {key}"
+    );
+    let script = format!(
+        "f=$(getent passwd {user} | cut -d: -f6)/.ssh/authorized_keys; \
+         if sudo grep -qF '{key}' \"$f\"; then echo already registered; else echo '{line}' | sudo tee -a \"$f\" >/dev/null && echo registered; fi"
+    );
+    let st = Command::new("ssh").args([admin, &script]).status().unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")));
+    if !st.success() {
+        die("registration failed");
+    }
 }
 
 /// Runs a command on the server through the restricted key; returns stdout.
@@ -250,7 +316,10 @@ fn browse_download() {
 }
 
 fn base_url() -> String {
-    env::var("UPLOAD_BASE_URL").unwrap_or_else(|_| "https://anurag3301.dev/f".into())
+    env::var("UPLOAD_BASE_URL").ok().or_else(|| saved("base_url")).unwrap_or_else(|| {
+        let h = host();
+        format!("https://{}/f", h.split_once('@').map_or(h.as_str(), |(_, h)| h))
+    })
 }
 
 fn browse_delete() {
@@ -290,6 +359,9 @@ fn main() {
     let a: Vec<String> = env::args().skip(1).collect();
     match a.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [] | ["-h"] | ["--help"] => println!("{HELP}"),
+        ["setup", d] => setup(d, None),
+        ["setup", d, b] => setup(d, Some(b)),
+        ["register", a] => register(a),
         ["stat"] => stat(),
         ["list"] | ["ls"] => browse_download(),
         ["rm"] => browse_delete(),
